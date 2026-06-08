@@ -448,11 +448,6 @@ jobs:
             -d CONFIG_CPU_FREQ_DEFAULT_GOV_SCHEDUTIL
 
           scripts/config --file "$CFG" \
-            -e CONFIG_LRU_GEN \
-            -e CONFIG_LRU_GEN_ENABLED \
-            -e CONFIG_LRU_GEN_STATS
-
-          scripts/config --file "$CFG" \
             -e CONFIG_UCLAMP_TASK \
             -e CONFIG_UCLAMP_TASK_GROUP
 
