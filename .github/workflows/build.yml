@@ -1,0 +1,610 @@
+name: Kernel Build — Azure-vR4
+
+on:
+  workflow_dispatch:
+    inputs:
+      ksu_variant:
+        description: 'KernelSU variant (ALL = KSUN + ReSuKiSU + VANILLA)'
+        type: choice
+        options:
+          - KSUN
+          - ReSuKiSU
+          - VANILLA
+          - ALL
+        default: KSUN
+
+      clang_variant:
+        description: 'Clang toolchain'
+        type: choice
+        options:
+          - LLVM_22
+          - NEUTRON_19
+          - YUKI_23
+          - ALL
+        default: LLVM_22
+
+      kernel_branch:
+        description: 'Kernel branch to build'
+        type: string
+        default: android12-5.10-staging
+
+env:
+  GIT_TERMINAL_PROMPT: 0
+  KERNEL_NAME: Azure-vR4
+  BUILD_USER: whiskiesweet
+
+jobs:
+  setup:
+    runs-on: ubuntu-latest
+    outputs:
+      ksu_variants:   ${{ steps.resolve.outputs.ksu_variants }}
+      clang_variants: ${{ steps.resolve.outputs.clang_variants }}
+
+    steps:
+      - name: Resolve build matrix
+        id: resolve
+        run: |
+          if [ "${{ inputs.ksu_variant }}" = "ALL" ]; then
+            echo 'ksu_variants=["KSUN","ReSuKiSU","VANILLA"]' >> $GITHUB_OUTPUT
+          else
+            echo 'ksu_variants=["${{ inputs.ksu_variant }}"]' >> $GITHUB_OUTPUT
+          fi
+
+          if [ "${{ inputs.clang_variant }}" = "ALL" ]; then
+            echo 'clang_variants=["LLVM_22","NEUTRON_19","YUKI_23"]' >> $GITHUB_OUTPUT
+          else
+            echo 'clang_variants=["${{ inputs.clang_variant }}"]' >> $GITHUB_OUTPUT
+          fi
+
+  build:
+    needs: setup
+    runs-on: ubuntu-latest
+    timeout-minutes: 150
+    strategy:
+      fail-fast: false
+      matrix:
+        ksu:   ${{ fromJson(needs.setup.outputs.ksu_variants) }}
+        clang: ${{ fromJson(needs.setup.outputs.clang_variants) }}
+
+    steps:
+      - name: Set build metadata
+        run: |
+          case "${{ matrix.ksu }}" in
+            KSUN)     DISPLAY="Azure-vR4-KSUN" ;;
+            ReSuKiSU) DISPLAY="Azure-vR4-ReSuKiSU" ;;
+            VANILLA)  DISPLAY="Azure-vR4-VANILLA" ;;
+          esac
+          echo "KERNEL_DISPLAY=${DISPLAY}" >> $GITHUB_ENV
+          echo "ARTIFACT=${DISPLAY}-${{ matrix.clang }}-$(date +%Y%m%d-%H%M)" >> $GITHUB_ENV
+          echo "Kernel: ${DISPLAY} | Clang: ${{ matrix.clang }} | Branch: ${{ inputs.kernel_branch }}"
+
+      - name: Free disk space
+        run: |
+          df -h
+          sudo rm -rf \
+            /usr/local/lib/android /usr/share/dotnet \
+            /opt/ghc /usr/local/share/boost \
+            /opt/hostedtoolcache/CodeQL /usr/share/swift \
+            /usr/local/julia* /usr/share/kotlinc \
+            /usr/local/lib/node_modules /opt/microsoft /imagegeneration
+
+          sudo apt-get remove -y \
+            '^dotnet-.*' '^llvm-.*' 'php.*' \
+            '^mongodb-.*' '^mysql-.*' \
+            azure-cli google-cloud-sdk \
+            google-chrome-stable firefox \
+            powershell mono-devel \
+            --fix-missing 2>/dev/null || true
+          sudo apt-get autoremove -y
+          sudo apt-get clean
+          df -h
+
+      - name: Setup swap
+        run: |
+          sudo swapoff -a 2>/dev/null || true
+
+          AVAIL_KB=$(df / --output=avail -k | tail -1)
+          SWAP_KB=$(( AVAIL_KB * 75 / 100 ))
+          MAX_KB=$(( 16 * 1024 * 1024 ))
+          [ "$SWAP_KB" -gt "$MAX_KB" ] && SWAP_KB=$MAX_KB
+          SWAP_SIZE="${SWAP_KB}K"
+
+          echo "Alokasi swap: ${SWAP_SIZE}"
+          sudo fallocate -l "${SWAP_SIZE}" /swapfile
+          sudo chmod 600 /swapfile
+          sudo mkswap /swapfile
+          sudo swapon /swapfile -p 100
+
+          sudo sysctl vm.swappiness=10
+          sudo sysctl vm.vfs_cache_pressure=50
+          sudo sysctl vm.min_free_kbytes=32768
+          sudo sysctl vm.dirty_ratio=10
+          sudo sysctl vm.dirty_background_ratio=5
+          echo 1 | sudo tee /proc/sys/vm/overcommit_memory
+          free -h && swapon --show
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y --no-install-recommends \
+            bc bison flex build-essential libssl-dev libelf-dev \
+            cpio kmod rsync zip patch curl ca-certificates \
+            python3 git wget zstd tar xz-utils
+
+          git config --global credential.helper ""
+          git config --global user.email "build@github.actions"
+          git config --global user.name  "GitHub Actions"
+
+      - name: Download LLVM 22.1.3 (kernel.org)
+        if: matrix.clang == 'LLVM_22'
+        run: |
+          mkdir -p ~/toolchain/llvm22
+          wget -q --show-progress --tries=3 \
+            "https://mirrors.edge.kernel.org/pub/tools/llvm/files/llvm-22.1.3-x86_64.tar.xz" \
+            -O /tmp/llvm22.tar.xz
+          tar -xf /tmp/llvm22.tar.xz -C ~/toolchain/llvm22 --strip-components=1
+          rm /tmp/llvm22.tar.xz
+
+      - name: Download Neutron Clang 19 (+PGO +BOLT)
+        if: matrix.clang == 'NEUTRON_19'
+        run: |
+          mkdir -p ~/toolchain/neutron
+          cd ~/toolchain/neutron
+          curl -LO https://raw.githubusercontent.com/Neutron-Toolchains/antman/main/antman
+          chmod +x antman
+          ./antman -S=10032024
+          ./antman --patch=glibc
+
+      - name: Download Yuki Clang 23 (+BOLT)
+        if: matrix.clang == 'YUKI_23'
+        run: |
+          mkdir -p ~/toolchain/yuki23
+          cd ~/toolchain/yuki23
+          wget -q --show-progress --tries=3 \
+            -O yuki.tar.zst \
+            "https://usc1.contabostorage.com/ab57618a161b456a8d009c2e2de4a408:xperience/toolchains/yuki-clang-+bolt-20260124.tar.zst"
+          tar --use-compress-program=unzstd -xf yuki.tar.zst
+          rm -f yuki.tar.zst
+
+      - name: Export CLANG_PATH
+        run: |
+          case "${{ matrix.clang }}" in
+            LLVM_22)    echo "CLANG_PATH=$HOME/toolchain/llvm22"  >> $GITHUB_ENV ;;
+            NEUTRON_19) echo "CLANG_PATH=$HOME/toolchain/neutron" >> $GITHUB_ENV ;;
+            YUKI_23)    echo "CLANG_PATH=$HOME/toolchain/yuki23"  >> $GITHUB_ENV ;;
+          esac
+
+      - name: Verify clang
+        run: |
+          export PATH="$CLANG_PATH/bin:$PATH"
+          which clang
+          clang --version
+
+      - name: Checkout kernel source
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.kernel_branch }}
+          fetch-depth: 1
+
+      - name: Strip EXTRAVERSION dari Makefile
+        run: |
+          sed -i 's/^EXTRAVERSION = .*/EXTRAVERSION =/' Makefile
+          grep "^EXTRAVERSION" Makefile
+
+      - name: Apply SUSFS kernel patches
+        run: |
+          git -c credential.helper= clone --depth=1 \
+            https://gitlab.com/simonpunk/susfs4ksu.git \
+            -b gki-android12-5.10 /tmp/susfs4ksu
+
+          SUSFS_KPATCH="/tmp/susfs4ksu/kernel_patches"
+
+          cp "$SUSFS_KPATCH/fs/susfs.c"            fs/
+          cp "$SUSFS_KPATCH/include/linux/susfs.h" include/linux/
+          [ -f "$SUSFS_KPATCH/include/linux/susfs_def.h" ] && \
+            cp "$SUSFS_KPATCH/include/linux/susfs_def.h" include/linux/ || true
+
+          PATCH_OUTPUT=$(mktemp)
+
+          if patch -p1 --forward \
+               < "$SUSFS_KPATCH/50_add_susfs_in_gki-android12-5.10.patch" \
+               2>&1 | tee "$PATCH_OUTPUT"; then
+            echo "✓ SUSFS kernel patch: APPLIED"
+          else
+            if grep -q "Reversed (or previously applied)" "$PATCH_OUTPUT"; then
+              echo "△ SUSFS kernel patch: sudah diterapkan sebelumnya (skip OK)"
+            else
+              echo "ERROR: SUSFS kernel patch GAGAL DITERAPKAN!"
+              cat "$PATCH_OUTPUT"
+              find . -name "*.rej" | head -20
+              find . -name "*.rej" | head -1 | xargs cat 2>/dev/null || echo "(tidak ada .rej)"
+              rm -f "$PATCH_OUTPUT"
+              exit 1
+            fi
+          fi
+
+          rm -f "$PATCH_OUTPUT"
+          echo "SUSFS_DIR=/tmp/susfs4ksu" >> $GITHUB_ENV
+
+      - name: Integrate KernelSU-Next
+        if: matrix.ksu == 'KSUN'
+        run: |
+          curl -LSs \
+            "https://raw.githubusercontent.com/pershoot/KernelSU-Next/dev-susfs/kernel/setup.sh" \
+            | bash -s dev-susfs
+
+          [ -d "KernelSU" ] || [ -d "KernelSU-Next" ] || \
+            { echo "ERROR: KSUN integration gagal"; ls -la; exit 1; }
+          echo "✓ KernelSU-Next (dev-susfs) integrated"
+
+      - name: Integrate ReSuKiSU
+        if: matrix.ksu == 'ReSuKiSU'
+        run: |
+          curl -LSs \
+            "https://raw.githubusercontent.com/ReSukiSU/ReSukiSU/main/kernel/setup.sh" \
+            | bash -s main
+
+          [ -d "KernelSU" ] || \
+            { echo "ERROR: ReSuKiSU integration gagal"; ls -la; exit 1; }
+          echo "✓ ReSuKiSU integrated"
+
+      - name: Apply SUSFS glue patch (ReSuKiSU only)
+        if: matrix.ksu == 'ReSuKiSU'
+        run: |
+          SUSFS_PATCHES="${SUSFS_DIR}/kernel_patches"
+
+          KSU_PATCH=""
+          for p in \
+            "$SUSFS_PATCHES/SukiSU/10_enable_susfs_for_ksu.patch" \
+            "$SUSFS_PATCHES/KernelSU/10_enable_susfs_for_ksu.patch"; do
+            [ -f "$p" ] && KSU_PATCH="$p" && break
+          done
+
+          if [ -z "$KSU_PATCH" ]; then
+            echo "ERROR: SUSFS SukiSU patch tidak ditemukan, list patches:"
+            find "$SUSFS_PATCHES" -name "*.patch"
+            exit 1
+          fi
+
+          GLUE_OUTPUT=$(mktemp)
+          if patch -p1 --forward < "$KSU_PATCH" 2>&1 | tee "$GLUE_OUTPUT"; then
+            echo "✓ SUSFS SukiSU glue patch: APPLIED"
+          else
+            if grep -q "Reversed (or previously applied)" "$GLUE_OUTPUT"; then
+              echo "△ SUSFS SukiSU glue patch: sudah ada (skip OK)"
+            else
+              echo "ERROR: SUSFS SukiSU glue patch GAGAL"
+              cat "$GLUE_OUTPUT"
+              find . -name "*.rej" | head -10
+              rm -f "$GLUE_OUTPUT"
+              exit 1
+            fi
+          fi
+          rm -f "$GLUE_OUTPUT"
+
+      - name: Apply Azure-vR4 custom patches
+        run: |
+          PATCH_DIR="kernel-patches"
+
+          if [ ! -d "$PATCH_DIR" ]; then
+            echo "△ kernel-patches/ tidak ditemukan — skip"
+            exit 0
+          fi
+
+          PATCH_LIST=$(find "$PATCH_DIR" -maxdepth 1 -name "*.patch" | sort)
+
+          if [ -z "$PATCH_LIST" ]; then
+            echo "△ Tidak ada .patch file — skip"
+            exit 0
+          fi
+
+          FAILED=0
+          for patch in $PATCH_LIST; do
+            PNAME=$(basename "$patch")
+            OUT=$(mktemp)
+            if patch -p1 --forward --fuzz=3 < "$patch" > "$OUT" 2>&1; then
+              echo "✓ Applied: $PNAME"
+            else
+              if grep -q "Reversed (or previously applied)" "$OUT"; then
+                echo "△ Sudah ada (skip OK): $PNAME"
+              else
+                echo "✗ GAGAL: $PNAME"
+                cat "$OUT"
+                find . -name "*.rej" | head -5 | xargs -I{} sh -c 'echo "REJ: {}"; cat {}'
+                FAILED=$((FAILED + 1))
+              fi
+            fi
+            rm -f "$OUT"
+          done
+
+          if [ "$FAILED" -gt 0 ]; then
+            echo "$FAILED patch GAGAL diterapkan!"
+            exit 1
+          fi
+
+          echo "✓ Semua custom patches berhasil applied"
+
+      - name: Wire Zenith into Makefile and Kconfig
+        run: |
+          # --- 1. kernel/sched/Makefile ---
+          if grep -q "cpufreq_zenith" kernel/sched/Makefile 2>/dev/null; then
+            echo "△ kernel/sched/Makefile: entry sudah ada"
+          else
+            echo 'obj-$(CONFIG_CPU_FREQ_GOV_ZENITH) += cpufreq_zenith.o' \
+              >> kernel/sched/Makefile
+            echo "✓ kernel/sched/Makefile: Zenith entry added"
+          fi
+
+          # --- 2. drivers/cpufreq/Kconfig ---
+          if grep -q "CPU_FREQ_GOV_ZENITH" drivers/cpufreq/Kconfig 2>/dev/null; then
+            echo "△ drivers/cpufreq/Kconfig: entry sudah ada"
+          else
+            sed -i '/config CPU_FREQ_DEFAULT_GOV_SCHEDUTIL/i \
+            config CPU_FREQ_DEFAULT_GOV_ZENITH\n\tbool "zenith"\n\tselect CPU_FREQ_GOV_ZENITH\n\thelp\n\t  Use Zenith as default cpufreq governor.\n' drivers/cpufreq/Kconfig
+
+            {
+              printf '\nconfig CPU_FREQ_GOV_ZENITH\n'
+              printf '\ttristate "%s"\n' "'zenith' cpufreq governor"
+              printf '\tdepends on CPU_FREQ\n'
+              printf '\thelp\n'
+              printf '\t  Zenith hybrid CPUFreq governor (schedutil+ondemand+hispeed+input boost).\n'
+              printf '\t  Built for interactive Android UI on ARM SoCs.\n'
+              printf '\t  If in doubt, say N.\n'
+            } >> drivers/cpufreq/Kconfig
+            echo "✓ drivers/cpufreq/Kconfig: Zenith entry added"
+          fi
+
+          # --- 3. Sanity check: pastikan seluruh file driver dan header lengkap ---
+          for f in \
+            kernel/sched/cpufreq_zenith.c \
+            include/trace/events/cpufreq_zenith.h \
+            include/linux/cpufreq_zenith.h \
+            include/linux/hikari.h; do
+            if [ -f "$f" ] && [ -s "$f" ]; then
+              echo "✓ $f ($(wc -l < $f) baris)"
+            else
+              echo "✗ $f: TIDAK ADA atau FILE KOSONG!"
+              exit 1
+            fi
+          done
+
+      - name: Fix binder API call site (post-patch)
+        run: |
+          # Fix: tambah current->pid sebagai argumen ke-6
+          # yang ditambahkan oleh binder-backports.patch
+          sed -i \
+            's/!reply && (t->flags & TF_ONE_WAY));/!reply \&\& (t->flags \& TF_ONE_WAY), current->pid);/' \
+            drivers/android/binder.c
+
+          grep "binder_alloc_new_buf" drivers/android/binder.c | grep -v "current->pid" \
+            && echo "⚠ Masih ada call site tanpa pid!" \
+            || echo "✓ Semua call site sudah include pid"
+
+      - name: Generate base config
+        run: |
+          export PATH="$CLANG_PATH/bin:$PATH"
+          mkdir -p out
+          make ARCH=arm64 O=out \
+            CC=clang LD=ld.lld \
+            AR=llvm-ar NM=llvm-nm \
+            OBJCOPY=llvm-objcopy OBJDUMP=llvm-objdump \
+            READELF=llvm-readelf STRIP=llvm-strip \
+            HOSTCC=clang HOSTCXX=clang++ \
+            CROSS_COMPILE=aarch64-linux-gnu- \
+            LLVM=1 LLVM_IAS=1 \
+            gki_defconfig
+
+      - name: Apply Azure-vR4 kernel config
+        run: |
+          CFG="out/.config"
+
+          scripts/config --file "$CFG" \
+            --set-str CONFIG_LOCALVERSION "-${KERNEL_DISPLAY}"
+
+          scripts/config --file "$CFG" -d CONFIG_LOCALVERSION_AUTO
+
+          scripts/config --file "$CFG" \
+            -d CONFIG_DEBUG_INFO \
+            -d CONFIG_DEBUG_INFO_DWARF4 \
+            -d CONFIG_DEBUG_INFO_DWARF5 \
+            -e CONFIG_DEBUG_INFO_NONE
+
+          scripts/config --file "$CFG" \
+            -d CONFIG_LTO_NONE \
+            -e CONFIG_LTO_CLANG \
+            -e CONFIG_LTO_CLANG_THIN \
+            -d CONFIG_LTO_CLANG_FULL
+
+          scripts/config --file "$CFG" \
+            -e CONFIG_IOSCHED_BFQ \
+            -e CONFIG_BFQ_GROUP_IOSCHED \
+            -e CONFIG_MQ_IOSCHED_DEADLINE \
+            -e CONFIG_MQ_IOSCHED_KYBER
+
+          scripts/config --file "$CFG" \
+            -e CONFIG_TCP_CONG_BBR \
+            -e CONFIG_NET_SCH_FQ \
+            -e CONFIG_NET_SCH_FQ_CODEL \
+            -m CONFIG_WIREGUARD
+
+          scripts/config --file "$CFG" \
+            -e CONFIG_ZRAM \
+            -e CONFIG_CRYPTO_ZSTD \
+            -e CONFIG_CRYPTO_LZ4 \
+            -e CONFIG_CRYPTO_LZ4HC \
+            -e CONFIG_ZSMALLOC
+
+          scripts/config --file "$CFG" \
+            -e CONFIG_KALLSYMS \
+            -e CONFIG_KALLSYMS_ALL \
+            -e CONFIG_KPROBES \
+            -e CONFIG_MODULES \
+            -e CONFIG_MODULE_UNLOAD \
+            -e CONFIG_MODULE_FORCE_LOAD
+
+          scripts/config --file "$CFG" \
+            -e CONFIG_CPU_FREQ_GOV_ZENITH \
+            -e CONFIG_CPU_FREQ_DEFAULT_GOV_ZENITH \
+            -d CONFIG_CPU_FREQ_DEFAULT_GOV_SCHEDUTIL
+
+          scripts/config --file "$CFG" \
+            -e CONFIG_LRU_GEN \
+            -e CONFIG_LRU_GEN_ENABLED \
+            -e CONFIG_LRU_GEN_STATS
+
+          scripts/config --file "$CFG" \
+            -e CONFIG_UCLAMP_TASK \
+            -e CONFIG_UCLAMP_TASK_GROUP
+
+          scripts/config --file "$CFG" \
+            -d CONFIG_NUMA \
+            -d CONFIG_NODES_SPAN_OTHER_NODES
+
+          if [ "${{ matrix.ksu }}" = "ReSuKiSU" ]; then
+            scripts/config --file "$CFG" -e CONFIG_KPM
+          fi
+
+          if [ "${{ matrix.ksu }}" != "VANILLA" ]; then
+            scripts/config --file "$CFG" \
+              -e CONFIG_KSU_SUSFS \
+              -e CONFIG_KSU_SUSFS_SUS_PATH \
+              -e CONFIG_KSU_SUSFS_SUS_MOUNT \
+              -e CONFIG_KSU_SUSFS_SUS_KSTAT \
+              -e CONFIG_KSU_SUSFS_TRY_UMOUNT \
+              -e CONFIG_KSU_SUSFS_SPOOF_UNAME \
+              -e CONFIG_KSU_SUSFS_AUTO_ADD_SUS_KSU_DEFAULT_MOUNT \
+              -e CONFIG_KSU_SUSFS_AUTO_ADD_TRY_UMOUNT_FOR_BIND_MOUNT
+          fi
+
+          export PATH="$CLANG_PATH/bin:$PATH"
+          make ARCH=arm64 O=out \
+            CC=clang LD=ld.lld \
+            HOSTCC=clang HOSTCXX=clang++ \
+            CROSS_COMPILE=aarch64-linux-gnu- \
+            LLVM=1 LLVM_IAS=1 \
+            olddefconfig
+
+          grep -E "CONFIG_KPM|CONFIG_KSU|CONFIG_SUSFS|CONFIG_KALLSYMS|CONFIG_ZRAM|CONFIG_LTO|CONFIG_LOCALVERSION|CONFIG_DEBUG_INFO|CONFIG_LRU_GEN|CONFIG_UCLAMP|CONFIG_FAST_CHARGE|CONFIG_IRQ_SBALANCE|CONFIG_NUMA|CONFIG_CPU_FREQ_GOV_ZENITH" out/.config || true
+
+      - name: Drop caches before build
+        run: |
+          sync && echo 3 | sudo tee /proc/sys/vm/drop_caches
+          free -h
+
+      - name: Build kernel
+        run: |
+          export PATH="$CLANG_PATH/bin:$PATH"
+
+          CLANG_VER=$(clang --version | head -1 \
+            | grep -oP '(?<=clang version )\S+' | cut -d. -f1-2)
+
+          case "${{ matrix.clang }}" in
+            LLVM_22)    TC_LABEL="llvm" ;;
+            NEUTRON_19) TC_LABEL="neutron" ;;
+            YUKI_23)    TC_LABEL="yuki" ;;
+          esac
+
+          BUILD_HOST="Azure-vR4[${TC_LABEL}-${CLANG_VER}+pgo+bolt+thinLTO]"
+          BUILD_LOG=/tmp/build_${{ matrix.ksu }}_${{ matrix.clang }}.log
+
+          echo "=== Mulai build: $(date) ==="
+          echo "Host: ${BUILD_HOST}"
+
+          set -o pipefail
+          make ARCH=arm64 O=out \
+            CC=clang LD=ld.lld \
+            AR=llvm-ar NM=llvm-nm \
+            OBJCOPY=llvm-objcopy OBJDUMP=llvm-objdump \
+            READELF=llvm-readelf STRIP=llvm-strip \
+            HOSTCC=clang HOSTCXX=clang++ \
+            CROSS_COMPILE=aarch64-linux-gnu- \
+            LLVM=1 LLVM_IAS=1 \
+            KBUILD_BUILD_USER="${BUILD_USER}" \
+            KBUILD_BUILD_HOST="${BUILD_HOST}" \
+            -j$(nproc --all) 2>&1 | tee "$BUILD_LOG"
+
+          BUILD_STATUS=${PIPESTATUS[0]}
+
+          if [ "$BUILD_STATUS" -ne 0 ]; then
+            echo "BUILD GAGAL! (exit code $BUILD_STATUS)"
+            grep -E \
+              "error:|undefined reference|undeclared|implicit declaration|warning: implicit" \
+              "$BUILD_LOG" | tail -50
+            tail -60 "$BUILD_LOG"
+            exit "$BUILD_STATUS"
+          fi
+
+          echo "=== Build selesai: $(date) ==="
+
+      - name: Verify build
+        run: |
+          echo "KSU=${{ matrix.ksu }} | Clang=${{ matrix.clang }}"
+          make ARCH=arm64 O=out kernelrelease
+          grep LINUX_COMPILER out/include/generated/compile.h || true
+          ls -lh out/arch/arm64/boot/Image
+
+          grep -c "susfs" out/System.map 2>/dev/null \
+            && echo "✓ SUSFS symbols ditemukan" \
+            || echo "⚠ SUSFS symbols tidak ditemukan — cek patch!"
+
+          RELEASE=$(make ARCH=arm64 O=out kernelrelease 2>/dev/null | tail -1)
+          echo "Kernel release: ${RELEASE}"
+          echo "${RELEASE}" | grep -q "\-rc" \
+            && echo "⚠ Masih ada -rc di nama!" \
+            || echo "✓ Tidak ada -rc suffix"
+          echo "${RELEASE}" | grep -qP "\-g[0-9a-f]{7,}" \
+            && echo "⚠ Masih ada git hash di nama!" \
+            || echo "✓ Tidak ada git hash suffix"
+
+          free -h && df -h
+
+      - name: Clone AnyKernel3
+        run: |
+          git -c credential.helper= clone --depth=1 \
+            https://github.com/osm0sis/AnyKernel3.git AnyKernel3
+
+      - name: Configure anykernel.sh
+        run: |
+          printf '%s\n' \
+            "# AnyKernel3 — ${KERNEL_DISPLAY} by ${BUILD_USER}" \
+            "properties() { '" \
+            "kernel.string=${KERNEL_DISPLAY} by ${BUILD_USER}" \
+            'do.devicecheck=0' \
+            'do.modules=0' \
+            'do.systemless=1' \
+            'do.cleanup=1' \
+            'do.cleanuponabort=1' \
+            "'; }" \
+            '' \
+            'block=/dev/block/by-name/boot;' \
+            'is_slot_device=auto;' \
+            'ramdisk_compression=auto;' \
+            'patch_vbmeta_flag=auto;' \
+            '' \
+            '. tools/ak3-core.sh;' \
+            'split_boot;' \
+            'flash_boot;' \
+            > AnyKernel3/anykernel.sh
+
+      - name: Prepare flashable package
+        run: |
+          cp out/arch/arm64/boot/Image AnyKernel3/
+          cd AnyKernel3
+          rm -rf .git .github README.md ramdisk patch
+          ls -lh
+
+      - name: Upload flashable ZIP
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.ARTIFACT }}
+          path: AnyKernel3/
+          compression-level: 9
+
+      - name: Upload build artifacts (Image + .config)
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.ARTIFACT }}-buildfiles
+          path: |
+            out/arch/arm64/boot/Image*
+            out/.config
+          if-no-files-found: warn
