@@ -1,0 +1,13 @@
+--- a/kernel/sched/pelt.c	2026-06-08 05:15:01.419613834 +0000
++++ b/kernel/sched/pelt.c	2026-06-08 05:13:01.457070197 +0000
+@@ -563,8 +563,8 @@
+ #include <trace/hooks/sched.h>
+ DEFINE_PER_CPU(u64, clock_task_mult);
+ 
+-unsigned int sysctl_sched_pelt_multiplier = 1;
+-__read_mostly unsigned int sched_pelt_lshift;
++unsigned int sysctl_sched_pelt_multiplier = 2;
++__read_mostly unsigned int sched_pelt_lshift = 1;
+ 
+ int sched_pelt_multiplier(struct ctl_table *table, int write, void *buffer,
+ 			  size_t *lenp, loff_t *ppos)
