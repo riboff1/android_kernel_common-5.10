@@ -32,3 +32,9 @@ jobs:
         path: |
           ${{ steps.build.outputs.outfile }}
           ./out/drivers/memkernel/memkernel.ko
+    - name: Find modules
+      run: |
+        find out -name "*.ko"
+    - name: Check memkernel output
+      run: |
+        ls -R out/drivers/memkernel || true
