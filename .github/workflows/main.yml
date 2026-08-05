@@ -22,7 +22,7 @@ jobs:
       with:
         arch: arm64
         compiler: clang/15
-        defconfig: gki_defconfig
+        defconfig: defconfig
         image: Image
 
     - name: Upload Kernel and Module
